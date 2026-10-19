@@ -205,7 +205,7 @@ class PlatformAuditEventListView(_AuditBaseView):
                     "count": 1,
                     "next": None,
                     "previous": None,
-                    "retention_days": 90,
+                    "retention_days": 365,
                     "results": [_EXAMPLE_EVENT],
                 },
             )

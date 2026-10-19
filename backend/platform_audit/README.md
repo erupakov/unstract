@@ -53,7 +53,7 @@ Results are always newest first; an `ordering` parameter is ignored.
   "count": 1,
   "next": null,
   "previous": null,
-  "retention_days": 90,
+  "retention_days": 365,
   "results": [
     {
       "id": "3f0d6c1e-5a0b-4a39-9a7e-0d6f3c2b1a90",
@@ -233,7 +233,7 @@ Per-deployment API keys (`api_v2`) are not recorded.
 
 ## Retention
 
-`PLATFORM_AUDIT_RETENTION_DAYS` (env, default **90**) is the default; an
+`PLATFORM_AUDIT_RETENTION_DAYS` (env, default **365**) is the default; an
 organisation can override it with the `PLATFORM_AUDIT_RETENTION_DAYS`
 configuration key (1–3650). An env value outside 1–3650 is treated as 3650
 (fail closed). Reads ignore an override outside the range in favour of the env

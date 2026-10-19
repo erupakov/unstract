@@ -324,7 +324,9 @@ NOTIFICATION_MAX_DISPATCH_ATTEMPTS = int(
 # the default; each org can override it (Configuration key
 # PLATFORM_AUDIT_RETENTION_DAYS). Older rows are hidden from every read and are
 # deleted by the purge_platform_audit_events management command.
-PLATFORM_AUDIT_RETENTION_DAYS = int(os.environ.get("PLATFORM_AUDIT_RETENTION_DAYS", "90"))
+PLATFORM_AUDIT_RETENTION_DAYS = int(
+    os.environ.get("PLATFORM_AUDIT_RETENTION_DAYS", "365")
+)
 ATOMIC_REQUESTS = CommonUtils.str_to_bool(
     os.environ.get("DJANGO_ATOMIC_REQUESTS", "False")
 )

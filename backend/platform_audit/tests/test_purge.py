@@ -17,7 +17,7 @@ class PurgeCommandTests(AuditTestBase):
     def setUp(self) -> None:
         super().setUp()
         now = timezone.now()
-        for org, days in ((self.org, 1), (self.org, 100), (self.other_org, 200)):
+        for org, days in ((self.org, 1), (self.org, 400), (self.other_org, 500)):
             PlatformAuditEvent.objects.create(
                 organization=org,
                 occurred_at=now - timedelta(days=days),
@@ -40,8 +40,8 @@ class PurgeCommandTests(AuditTestBase):
         self.assertEqual(PlatformAuditEvent.objects.count(), 1)
 
     def test_each_organisation_uses_its_own_retention(self) -> None:
-        # other_org keeps a year: its 200-day event survives the 90-day default.
-        self._override(self.other_org, "365")
+        # other_org keeps two years: its 500-day event survives the 365-day default.
+        self._override(self.other_org, "730")
         # org keeps 50 days: a 60-day event the default would keep is deleted.
         self._override(self.org, "50")
         PlatformAuditEvent.objects.create(
@@ -56,11 +56,11 @@ class PurgeCommandTests(AuditTestBase):
             (e.organization_id == self.org.id, round(self._age(e)))
             for e in PlatformAuditEvent.objects.all()
         )
-        self.assertEqual(remaining, [(False, 200), (True, 1)])
+        self.assertEqual(remaining, [(False, 500), (True, 1)])
 
     def test_an_unreadable_retention_skips_that_organisation(self) -> None:
-        # Below the minimum: Configuration would fall back to the 90-day
-        # default and delete the 100-day event this org may mean to keep.
+        # Below the minimum: Configuration would fall back to the 365-day
+        # default and delete the 400-day event this org may mean to keep.
         self._override(self.org, "0")
         with self.assertRaises(CommandError):
             self._run()
@@ -68,7 +68,7 @@ class PurgeCommandTests(AuditTestBase):
             (e.organization_id == self.org.id, round(self._age(e)))
             for e in PlatformAuditEvent.objects.all()
         )
-        self.assertEqual(remaining, [(True, 1), (True, 100)])
+        self.assertEqual(remaining, [(True, 1), (True, 400)])
 
     def test_a_failed_retention_query_skips_that_organisation(self) -> None:
         with patch(

@@ -42,7 +42,7 @@ class AuditReadApiTests(AuditTestBase):
             "key.rotated", days_ago=2, target_name="ci-key", actor_email="bot@example.com"
         )
         self.group = self._event("group.created", days_ago=10, target_name="Finance")
-        self.expired = self._event("group.deleted", days_ago=91, target_name="Old")
+        self.expired = self._event("group.deleted", days_ago=366, target_name="Old")
         self.foreign = self._event(
             "group.created", days_ago=1, organization=self.other_org, target_name="Theirs"
         )
@@ -79,7 +79,7 @@ class AuditReadApiTests(AuditTestBase):
             [str(self.role.id), str(self.rotate.id), str(self.group.id)],
         )
         self.assertEqual(response.data["count"], 3)
-        self.assertEqual(response.data["retention_days"], 90)
+        self.assertEqual(response.data["retention_days"], 365)
 
     def test_row_shape(self) -> None:
         row = self._get(LIST, {"action": "member.role_changed"}).data["results"][0]
@@ -306,7 +306,7 @@ class AuditReadApiTests(AuditTestBase):
     def test_actors_include_removed_members_and_skip_expired(self) -> None:
         gone = make_user("gone@example.com")
         self._event("member.removed", days_ago=3, actor=gone, actor_email="gone@example.com")
-        self._event("member.removed", days_ago=95, actor_email="ancient@example.com")
+        self._event("member.removed", days_ago=370, actor_email="ancient@example.com")
         gone.delete()
         response = self._get(ACTORS)
         emails = [row["email"] for row in response.data]
