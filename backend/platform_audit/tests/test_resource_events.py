@@ -445,6 +445,33 @@ class CoOwnerRaceTests(ResourceEventTestBase):
             self.workflow.memberships.get(user=self.coowner).role, ResourceRole.OWNER
         )
 
+    def test_an_add_racing_an_unshare_and_reshare_still_makes_the_user_an_owner(
+        self,
+    ) -> None:
+        serializer = AddOwnerSerializer(
+            data={"user_id": self.coowner.id}, context=self._context()
+        )
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        manager_cls = type(self.workflow.memberships)
+        real_get_or_create = manager_cls.get_or_create
+
+        def share_unshare_reshare(manager, *args, **kwargs):
+            # A share/ makes them a viewer; the read returns that row; an
+            # unshare removes it and another share recreates it (a new pk).
+            real_get_or_create(
+                manager, user_id=kwargs["user_id"], defaults={"role": ResourceRole.VIEWER}
+            )
+            membership, created = real_get_or_create(manager, *args, **kwargs)
+            manager.filter(pk=membership.pk).delete()
+            manager.create(user_id=kwargs["user_id"], role=ResourceRole.VIEWER)
+            return membership, created
+
+        with patch.object(manager_cls, "get_or_create", share_unshare_reshare):
+            self.assertTrue(serializer.save())
+        self.assertEqual(
+            self.workflow.memberships.get(user=self.coowner).role, ResourceRole.OWNER
+        )
+
     def test_an_add_another_request_already_made_changes_nothing(self) -> None:
         serializer = AddOwnerSerializer(
             data={"user_id": self.coowner.id}, context=self._context()

@@ -44,24 +44,26 @@ class AddOwnerSerializer(serializers.Serializer):
         resource = self.context["resource"]
         user_id = self.validated_data["user_id"]
         with transaction.atomic():
-            # Reverse manager auto-scopes to this resource.
-            membership, created = resource.memberships.get_or_create(
-                user_id=user_id, defaults={"role": ResourceRole.OWNER}
-            )
-            if created:
-                return True
-            # Promote the existing row (e.g. a viewer, possibly added by a
-            # concurrent share) under a lock, as update_or_create did.
-            row = (
-                resource.memberships.select_for_update().filter(pk=membership.pk).first()
-            )
-            if row is None:  # a concurrent unshare removed it
-                resource.memberships.create(user_id=user_id, role=ResourceRole.OWNER)
-                return True
-            if row.role == ResourceRole.OWNER:
-                return False
-            resource.memberships.filter(pk=row.pk).update(role=ResourceRole.OWNER)
-            return True
+            # Reverse manager auto-scopes to this resource. Lock the user's row
+            # by key (a concurrent share/ may add, remove or recreate it);
+            # create one only when there is none, then lock what exists.
+            for _ in range(3):
+                row = (
+                    resource.memberships.select_for_update()
+                    .filter(user_id=user_id)
+                    .first()
+                )
+                if row is not None:
+                    if row.role == ResourceRole.OWNER:
+                        return False
+                    resource.memberships.filter(pk=row.pk).update(role=ResourceRole.OWNER)
+                    return True
+                _, created = resource.memberships.get_or_create(
+                    user_id=user_id, defaults={"role": ResourceRole.OWNER}
+                )
+                if created:
+                    return True
+        raise serializers.ValidationError("Could not add the co-owner; please retry.")
 
 
 class RemoveOwnerSerializer(serializers.Serializer):
