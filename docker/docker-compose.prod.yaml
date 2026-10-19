@@ -1,0 +1,503 @@
+# =============================================================================
+# Unstract — PRODUCTION overlay (external Postgres 17 / Redis / S3)
+# =============================================================================
+# Runs the whole platform on a single host in Docker, with Postgres, Redis and
+# object storage supplied EXTERNALLY. Everything the dev stack bundles as
+# infrastructure (Postgres, Redis, MinIO, Traefik, Flipt, Qdrant, RabbitMQ) is
+# either replaced by an external service or re-declared here with production
+# wiring.
+#
+# WHY A SEPARATE FILE: docker-compose.yaml hardcodes ENVIRONMENT=development on
+# every worker, points storage at MinIO, and hard-references the MinIO services.
+# A Compose *override* cannot drop those references (merge is additive), so
+# production gets its OWN top-level file that simply omits them. The dev path is
+# untouched.
+#
+# USAGE (see docker/README-production.md for the full runbook):
+#   cd docker
+#   cp sample.prod.essentials.env   prod.essentials.env     # externals + secrets
+#   cp sample.prod.backend.env      prod.backend.env        # optional hardening
+#   # ...and the other sample.prod.*.env you want to override
+#   # make sure backend/.env, platform-service/.env, runner/.env,
+#   # x2text-service/.env, workers/.env exist (run ./run-platform.sh -e once)
+#   VERSION=latest UNSTRACT_HOST=unstract.example.com \
+#     docker compose -f docker-compose.prod.yaml --env-file prod.essentials.env up -d
+#
+# `--env-file prod.essentials.env` is what feeds ${...} interpolation in THIS
+# file (UNSTRACT_HOST, the S3/DB/Redis values). The per-service `.env` files are
+# still read through each service's `env_file:`.
+#
+# What this stack starts:
+#   reverse-proxy (Traefik :80) · feature-flag (Flipt) · qdrant · rabbitmq
+#   backend · frontend · platform-service · x2text-service · runner
+#   worker-pg-orchestrator-{api,general} · fileproc · callback · scheduler
+#   metrics · executor · ide-callback · notification · reaper
+#   worker-log-stream-consumer · worker-log-history-scheduler-v2
+# What it does NOT start (external instead): Postgres, Redis, S3/MinIO.
+# =============================================================================
+
+name: ${COMPOSE_PROJECT_NAME:-unstract-prod}
+
+x-host-gateway: &host_gateway
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+
+# The production env layer for the worker fleet. Loaded AFTER the inline
+# `ENVIRONMENT=development`, so prod.workers.env wins and flips the fleet to
+# production.
+x-worker-env-files: &worker_env_files
+  - ../workers/.env
+  - ./prod.essentials.env
+  - ./prod.workers.env
+
+# The five object-storage env vars all resolve to the SAME interpolated JSON
+# blob (${UNSTRACT_S3_STORAGE_JSON}, built from UNSTRACT_S3_* in
+# prod.essentials.env). They are repeated inline per service because Compose
+# cannot merge a scalar with `<<`. For AWS S3 leave UNSTRACT_S3_ENDPOINT_URL
+# blank; region rides in client_kwargs so s3fs places it correctly.
+
+services:
+  # --- Infrastructure that stays in the stack -------------------------------
+  reverse-proxy:
+    image: traefik:v3.6.2
+    container_name: unstract-proxy
+    restart: unless-stopped
+    command: --api.insecure=true
+      --accesslog=true --log.level=INFO
+      --providers.docker=true --providers.docker.network=unstract-network
+      --providers.file.filename=/proxy_overrides.yaml --providers.file.watch=true
+    ports:
+      - "80:80"
+      - "8080:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./proxy_overrides.yaml:/proxy_overrides.yaml
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    labels:
+      - traefik.enable=false
+
+  feature-flag:
+    image: docker.flipt.io/flipt/flipt:v2.3.1
+    container_name: unstract-flipt
+    restart: unless-stopped
+    ports:
+      - "8082:8080" # REST API
+      - "9005:9000" # gRPC
+    volumes:
+      - flipt_data:/var/opt/flipt
+    labels:
+      - traefik.enable=false
+
+  qdrant:
+    image: "qdrant/qdrant:v1.16.1"
+    container_name: unstract-vector-db
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/var/lib/qdrant/data/
+    labels:
+      - traefik.enable=false
+
+  rabbitmq:
+    image: rabbitmq:4.1.0-management
+    container_name: unstract-rabbitmq
+    hostname: unstract-rabbit
+    restart: unless-stopped
+    env_file:
+      - ./prod.essentials.env
+    ports:
+      - "5672:5672" # AMQP
+      - "15672:15672" # Management UI
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    labels:
+      - traefik.enable=false
+
+  # --- Application services --------------------------------------------------
+  backend:
+    <<: *host_gateway
+    image: unstract/backend:${VERSION}
+    container_name: unstract-backend
+    restart: unless-stopped
+    command: --migrate
+    ports:
+      - "8000:8000"
+    env_file:
+      - ../backend/.env
+      - ./prod.essentials.env
+      - ./prod.backend.env
+    depends_on:
+      - reverse-proxy
+      - rabbitmq
+      - feature-flag
+    environment:
+      WORKFLOW_EXECUTION_FILE_STORAGE_CREDENTIALS: ${UNSTRACT_S3_STORAGE_JSON}
+      API_FILE_STORAGE_CREDENTIALS: ${UNSTRACT_S3_STORAGE_JSON}
+      PERMANENT_REMOTE_STORAGE: ${UNSTRACT_S3_STORAGE_JSON}
+      TEMPORARY_REMOTE_STORAGE: ${UNSTRACT_S3_STORAGE_JSON}
+      HITL_FILES_FILE_STORAGE_CREDENTIALS: ${UNSTRACT_S3_STORAGE_JSON}
+      APPLICATION_NAME: unstract-backend
+      LOG_TRANSPORT: redis
+      PG_SCHEDULER_ADOPT_PERIODICS: "true"
+      ENVIRONMENT: production
+      TOOL_REGISTRY_STORAGE_CREDENTIALS: '{"provider":"local"}'
+      # Public origin — keep aligned with UNSTRACT_HOST / WEB_APP_ORIGIN_URL.
+      WEB_APP_ORIGIN_URL: ${UNSTRACT_SCHEME:-http}://${UNSTRACT_HOST}
+      DJANGO_APP_BACKEND_URL: ${UNSTRACT_SCHEME:-http}://${UNSTRACT_HOST}
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.backend.rule=Host(`${UNSTRACT_HOST}`) && (PathPrefix(`/api/v1`) || PathPrefix(`/deployment`) || PathPrefix(`/public`))
+      - traefik.http.services.backend.loadbalancer.server.port=8000
+
+  frontend:
+    image: unstract/frontend:${VERSION}
+    container_name: unstract-frontend
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+      - reverse-proxy
+    environment:
+      - UNSTRACT_APPS_VERSION=${VERSION}
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.frontend.rule=Host(`${UNSTRACT_HOST}`) && !PathPrefix(`/api/v1`) && !PathPrefix(`/deployment`) && !PathPrefix(`/public`)
+      - traefik.http.services.frontend.loadbalancer.server.port=80
+
+  platform-service:
+    image: unstract/platform-service:${VERSION}
+    container_name: unstract-platform-service
+    restart: unless-stopped
+    ports:
+      - "3001:3001"
+    env_file:
+      - ../platform-service/.env
+      - ./prod.essentials.env
+      - ./prod.platform-service.env
+    labels:
+      - traefik.enable=false
+
+  x2text-service:
+    image: unstract/x2text-service:${VERSION}
+    container_name: unstract-x2text-service
+    restart: unless-stopped
+    ports:
+      - "3004:3004"
+    env_file:
+      - ../x2text-service/.env
+      - ./prod.essentials.env
+      - ./prod.x2text.env
+    labels:
+      - traefik.enable=false
+
+  runner:
+    <<: *host_gateway
+    image: unstract/runner:${VERSION}
+    container_name: unstract-runner
+    restart: unless-stopped
+    ports:
+      - 5002:5002
+    env_file:
+      - ../runner/.env
+      - ./prod.essentials.env
+      - ./prod.runner.env
+    environment:
+      LOG_TRANSPORT: redis
+      WORKFLOW_EXECUTION_FILE_STORAGE_CREDENTIALS: ${UNSTRACT_S3_STORAGE_JSON}
+    volumes:
+      - ./workflow_data:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      - rabbitmq
+    labels:
+      - traefik.enable=false
+
+  # --- PG-era worker fleet ---------------------------------------------------
+  # Each mirrors the dev service, minus the MinIO/external-infra deps, with the
+  # production env layer and S3 storage added. ENVIRONMENT=production comes from
+  # prod.workers.env (loaded after the inline value below, so it wins).
+
+  worker-pg-orchestrator-api:
+    image: unstract/worker-unified:${VERSION}
+    container_name: unstract-worker-pg-orchestrator-api
+    restart: unless-stopped
+    command: ["pg-queue-consumer"]
+    ports: ["8093:8090"]
+    env_file: *worker_env_files
+    depends_on: [rabbitmq]
+    environment:
+      ENVIRONMENT: development
+      APPLICATION_NAME: unstract-worker-pg-orchestrator-api
+      WORKER_BARRIER_BACKEND: pg
+      WORKER_PG_QUEUE_CONSUMER_WORKER_TYPE: api_deployment
+      WORKER_PG_QUEUE_CONSUMER_QUEUE: celery_api_deployments
+      WORKER_PG_QUEUE_CONSUMER_HEALTH_PORT: 8090
+      LOG_TRANSPORT: redis
+      WORKER_PG_QUEUE_CONSUMER_VT_SECONDS: ${WORKER_PG_ORCHESTRATOR_VT_SECONDS:-600}
+      WORKER_PG_QUEUE_CONSUMER_HEALTH_STALE_SECONDS: ${WORKER_PG_ORCHESTRATOR_HEALTH_STALE_SECONDS:-660}
+    labels: ["traefik.enable=false"]
+    volumes:
+      - ./workflow_data:/data
+      - ${TOOL_REGISTRY_CONFIG_SRC_PATH}:/data/tool_registry_config
+
+  worker-pg-orchestrator-general:
+    image: unstract/worker-unified:${VERSION}
+    container_name: unstract-worker-pg-orchestrator-general
+    restart: unless-stopped
+    command: ["pg-queue-consumer"]
+    ports: ["8094:8090"]
+    env_file: *worker_env_files
+    depends_on: [rabbitmq]
+    environment:
+      ENVIRONMENT: development
+      APPLICATION_NAME: unstract-worker-pg-orchestrator-general
+      WORKER_BARRIER_BACKEND: pg
+      WORKER_PG_QUEUE_CONSUMER_WORKER_TYPE: general
+      WORKER_PG_QUEUE_CONSUMER_QUEUE: celery
+      WORKER_PG_QUEUE_CONSUMER_HEALTH_PORT: 8090
+      LOG_TRANSPORT: redis
+      WORKER_PG_QUEUE_CONSUMER_VT_SECONDS: ${WORKER_PG_ORCHESTRATOR_VT_SECONDS:-600}
+      WORKER_PG_QUEUE_CONSUMER_HEALTH_STALE_SECONDS: ${WORKER_PG_ORCHESTRATOR_HEALTH_STALE_SECONDS:-660}
+    labels: ["traefik.enable=false"]
+    volumes:
+      - ./workflow_data:/data
+      - ${TOOL_REGISTRY_CONFIG_SRC_PATH}:/data/tool_registry_config
+
+  worker-pg-fileproc:
+    image: unstract/worker-unified:${VERSION}
+    container_name: unstract-worker-pg-fileproc
+    restart: unless-stopped
+    command: ["pg-queue-consumer"]
+    ports: ["8095:8090"]
+    env_file: *worker_env_files
+    depends_on: [rabbitmq]
+    environment:
+      ENVIRONMENT: development
+      APPLICATION_NAME: unstract-worker-pg-fileproc
+      WORKER_BARRIER_BACKEND: pg
+      WORKER_PG_QUEUE_CONSUMER_WORKER_TYPE: file_processing
+      WORKER_PG_QUEUE_CONSUMER_QUEUE: file_processing,file_processing_priority,api_file_processing
+      WORKER_PG_QUEUE_CONSUMER_HEALTH_PORT: 8090
+      LOG_TRANSPORT: redis
+      WORKER_PG_QUEUE_CONSUMER_CONCURRENCY: ${PG_FILEPROC_CONCURRENCY:-4}
+      WORKER_PG_QUEUE_CONSUMER_VT_SECONDS: ${WORKER_PG_FILEPROC_VT_SECONDS:-3660}
+      WORKER_PG_QUEUE_CONSUMER_HEALTH_STALE_SECONDS: ${WORKER_PG_FILEPROC_HEALTH_STALE_SECONDS:-3720}
+    labels: ["traefik.enable=false"]
+    volumes:
+      - ./workflow_data:/data
+      - ${TOOL_REGISTRY_CONFIG_SRC_PATH}:/data/tool_registry_config
+
+  worker-pg-callback:
+    image: unstract/worker-unified:${VERSION}
+    container_name: unstract-worker-pg-callback
+    restart: unless-stopped
+    command: ["pg-queue-consumer"]
+    ports: ["8096:8090"]
+    env_file: *worker_env_files
+    depends_on: [rabbitmq]
+    environment:
+      ENVIRONMENT: development
+      APPLICATION_NAME: unstract-worker-pg-callback
+      WORKER_BARRIER_BACKEND: pg
+      WORKER_PG_QUEUE_CONSUMER_WORKER_TYPE: callback
+      WORKER_PG_QUEUE_CONSUMER_QUEUE: file_processing_callback,celery_callback,api_file_processing_callback
+      WORKER_PG_QUEUE_CONSUMER_HEALTH_PORT: 8090
+      LOG_TRANSPORT: redis
+      WORKER_PG_QUEUE_CONSUMER_VT_SECONDS: ${WORKER_PG_CALLBACK_VT_SECONDS:-3660}
+      WORKER_PG_QUEUE_CONSUMER_HEALTH_STALE_SECONDS: ${WORKER_PG_CALLBACK_HEALTH_STALE_SECONDS:-3720}
+    labels: ["traefik.enable=false"]
+    volumes:
+      - ./workflow_data:/data
+      - ${TOOL_REGISTRY_CONFIG_SRC_PATH}:/data/tool_registry_config
+
+  worker-pg-scheduler:
+    image: unstract/worker-unified:${VERSION}
+    container_name: unstract-worker-pg-scheduler
+    restart: unless-stopped
+    command: ["pg-queue-consumer"]
+    ports: ["8098:8090"]
+    env_file: *worker_env_files
+    depends_on: [rabbitmq]
+    environment:
+      ENVIRONMENT: development
+      APPLICATION_NAME: unstract-worker-pg-scheduler
+      WORKER_BARRIER_BACKEND: pg
+      WORKER_PG_QUEUE_CONSUMER_WORKER_TYPE: scheduler
+      WORKER_PG_QUEUE_CONSUMER_QUEUE: scheduler
+      WORKER_PG_QUEUE_CONSUMER_HEALTH_PORT: 8090
+      LOG_TRANSPORT: redis
+      WORKER_PG_QUEUE_CONSUMER_VT_SECONDS: ${WORKER_PG_SCHEDULER_VT_SECONDS:-180}
+      WORKER_PG_QUEUE_CONSUMER_HEALTH_STALE_SECONDS: ${WORKER_PG_SCHEDULER_HEALTH_STALE_SECONDS:-240}
+    labels: ["traefik.enable=false"]
+    volumes:
+      - ./workflow_data:/data
+      - ${TOOL_REGISTRY_CONFIG_SRC_PATH}:/data/tool_registry_config
+
+  worker-pg-metrics:
+    image: unstract/worker-unified:${VERSION}
+    container_name: unstract-worker-pg-metrics
+    restart: unless-stopped
+    command: ["pg-queue-consumer"]
+    ports: ["8101:8090"]
+    env_file: *worker_env_files
+    depends_on: [rabbitmq]
+    environment:
+      ENVIRONMENT: development
+      APPLICATION_NAME: unstract-worker-pg-metrics
+      WORKER_BARRIER_BACKEND: pg
+      WORKER_PG_QUEUE_CONSUMER_WORKER_TYPE: scheduler
+      WORKER_PG_QUEUE_CONSUMER_QUEUE: dashboard_metric_events
+      WORKER_PG_QUEUE_CONSUMER_HEALTH_PORT: 8090
+      LOG_TRANSPORT: redis
+      WORKER_PG_QUEUE_CONSUMER_VT_SECONDS: ${WORKER_PG_METRICS_VT_SECONDS:-900}
+      WORKER_PG_QUEUE_CONSUMER_HEALTH_STALE_SECONDS: ${WORKER_PG_METRICS_HEALTH_STALE_SECONDS:-960}
+      WORKER_PG_QUEUE_CONSUMER_CONCURRENCY: 1
+      WORKER_PG_QUEUE_CONSUMER_MAX_ATTEMPTS: 1
+    labels: ["traefik.enable=false"]
+    volumes:
+      - ./workflow_data:/data
+      - ${TOOL_REGISTRY_CONFIG_SRC_PATH}:/data/tool_registry_config
+
+  worker-log-stream-consumer:
+    image: unstract/worker-unified:${VERSION}
+    container_name: unstract-worker-log-stream-consumer
+    restart: unless-stopped
+    command: ["log-stream-consumer"]
+    env_file: *worker_env_files
+    environment:
+      - ENVIRONMENT=development
+      - APPLICATION_NAME=unstract-worker-log-stream-consumer
+      - WORKER_TYPE=log_consumer
+      - WORKER_NAME=log-stream-consumer
+      - LOG_TRANSPORT=redis
+      - LOG_STREAM_QUEUE_NAME=${LOG_STREAM_QUEUE_NAME:-log_stream_queue}
+      - LOG_HISTORY_QUEUE_NAME=${LOG_HISTORY_QUEUE_NAME:-log_history_queue}
+      - ENABLE_LOG_HISTORY=${ENABLE_LOG_HISTORY:-true}
+    labels: ["traefik.enable=false"]
+
+  worker-pg-executor:
+    image: unstract/worker-unified:${VERSION}
+    container_name: unstract-worker-pg-executor
+    restart: unless-stopped
+    command: ["pg-queue-consumer"]
+    ports: ["8099:8090"]
+    env_file: *worker_env_files
+    depends_on: [rabbitmq, platform-service]
+    environment:
+      ENVIRONMENT: development
+      APPLICATION_NAME: unstract-worker-pg-executor
+      WORKER_BARRIER_BACKEND: pg
+      WORKER_PG_QUEUE_CONSUMER_WORKER_TYPE: executor
+      WORKER_PG_QUEUE_CONSUMER_QUEUE: celery_executor_legacy,celery_executor_agentic,celery_executor_table,celery_executor_smart_table,celery_executor_simple_prompt_studio,celery_executor_agentic_table,celery_executor_lookup_test
+      WORKER_PG_QUEUE_CONSUMER_HEALTH_PORT: 8090
+      LOG_TRANSPORT: redis
+      WORKER_PG_QUEUE_CONSUMER_VT_SECONDS: ${WORKER_PG_EXECUTOR_VT_SECONDS:-3660}
+      WORKER_PG_QUEUE_CONSUMER_HEALTH_STALE_SECONDS: ${WORKER_PG_EXECUTOR_HEALTH_STALE_SECONDS:-3720}
+      WORKER_PG_QUEUE_CONSUMER_CONCURRENCY: ${PG_EXECUTOR_CONCURRENCY:-4}
+      CELERY_QUEUES_EXECUTOR: ${CELERY_QUEUES_EXECUTOR:-celery_executor_legacy,celery_executor_agentic,celery_executor_agentic_table}
+    labels: ["traefik.enable=false"]
+    volumes:
+      - ./workflow_data:/data
+      - ${TOOL_REGISTRY_CONFIG_SRC_PATH}:/data/tool_registry_config
+      - prompt_studio_data:/app/prompt-studio-data
+
+  worker-pg-ide-callback:
+    image: unstract/worker-unified:${VERSION}
+    container_name: unstract-worker-pg-ide-callback
+    restart: unless-stopped
+    command: ["pg-queue-consumer"]
+    ports: ["8100:8090"]
+    env_file: *worker_env_files
+    depends_on: [rabbitmq, platform-service]
+    environment:
+      ENVIRONMENT: development
+      APPLICATION_NAME: unstract-worker-pg-ide-callback
+      WORKER_BARRIER_BACKEND: pg
+      WORKER_PG_QUEUE_CONSUMER_WORKER_TYPE: ide_callback
+      WORKER_PG_QUEUE_CONSUMER_QUEUE: ide_callback
+      WORKER_PG_QUEUE_CONSUMER_HEALTH_PORT: 8090
+      WORKER_PG_QUEUE_CONSUMER_CONCURRENCY: ${PG_IDE_CALLBACK_CONCURRENCY:-2}
+      LOG_TRANSPORT: redis
+      WORKER_PG_QUEUE_CONSUMER_VT_SECONDS: ${PG_IDE_CALLBACK_VT_SECONDS:-120}
+      WORKER_PG_QUEUE_CONSUMER_HEALTH_STALE_SECONDS: ${PG_IDE_CALLBACK_HEALTH_STALE_SECONDS:-180}
+    labels: ["traefik.enable=false"]
+    volumes:
+      - ./workflow_data:/data
+      - ${TOOL_REGISTRY_CONFIG_SRC_PATH}:/data/tool_registry_config
+      - prompt_studio_data:/app/prompt-studio-data
+
+  worker-pg-notification:
+    image: unstract/worker-unified:${VERSION}
+    container_name: unstract-worker-pg-notification
+    restart: unless-stopped
+    command: ["pg-queue-consumer"]
+    ports: ["8104:8090"]
+    env_file: *worker_env_files
+    depends_on: [rabbitmq, platform-service]
+    environment:
+      ENVIRONMENT: development
+      APPLICATION_NAME: unstract-worker-pg-notification
+      WORKER_BARRIER_BACKEND: pg
+      WORKER_PG_QUEUE_CONSUMER_WORKER_TYPE: notification
+      WORKER_PG_QUEUE_CONSUMER_QUEUE: notifications,notifications_webhook,notifications_email,notifications_sms,notifications_priority
+      WORKER_PG_QUEUE_CONSUMER_HEALTH_PORT: 8090
+      WORKER_PG_QUEUE_CONSUMER_CONCURRENCY: ${PG_NOTIFICATION_CONCURRENCY:-2}
+      LOG_TRANSPORT: redis
+      WORKER_PG_QUEUE_CONSUMER_VT_SECONDS: ${PG_NOTIFICATION_VT_SECONDS:-300}
+      WORKER_PG_QUEUE_CONSUMER_HEALTH_STALE_SECONDS: ${PG_NOTIFICATION_HEALTH_STALE_SECONDS:-360}
+    labels: ["traefik.enable=false"]
+    volumes:
+      - ./workflow_data:/data
+      - ${TOOL_REGISTRY_CONFIG_SRC_PATH}:/data/tool_registry_config
+      - prompt_studio_data:/app/prompt-studio-data
+
+  worker-pg-reaper:
+    image: unstract/worker-unified:${VERSION}
+    container_name: unstract-worker-pg-reaper
+    restart: unless-stopped
+    command: ["pg-queue-reaper"]
+    ports: ["8097:8086"]
+    env_file: *worker_env_files
+    depends_on: [rabbitmq]
+    environment:
+      ENVIRONMENT: development
+      APPLICATION_NAME: unstract-worker-pg-reaper
+      WORKER_PG_REAPER_INTERVAL_SECONDS: ${WORKER_PG_REAPER_INTERVAL_SECONDS:-5}
+      WORKER_PG_REAPER_HEALTH_PORT: 8086
+      LOG_TRANSPORT: redis
+      WORKER_PG_REAPER_SWEEP_SECONDS: ${WORKER_PG_REAPER_SWEEP_SECONDS:-300}
+      WORKER_PG_DEDUP_RETENTION_SECONDS: ${WORKER_PG_DEDUP_RETENTION_SECONDS:-86400}
+    labels: ["traefik.enable=false"]
+    volumes:
+      - ./workflow_data:/data
+      - ${TOOL_REGISTRY_CONFIG_SRC_PATH}:/data/tool_registry_config
+
+  worker-log-history-scheduler-v2:
+    <<: *host_gateway
+    image: unstract/worker-unified:${VERSION}
+    container_name: unstract-worker-log-history-scheduler-v2
+    restart: unless-stopped
+    entrypoint: ["/bin/bash"]
+    command: ["/app/log_consumer/scheduler.sh"]
+    env_file: *worker_env_files
+    depends_on: [rabbitmq]
+    environment:
+      - APPLICATION_NAME=unstract-worker-log-history-scheduler-v2
+      - LOG_TRANSPORT=redis
+      - LOG_HISTORY_CONSUMER_INTERVAL=${LOG_HISTORY_CONSUMER_INTERVAL:-5}
+      - TASK_TRIGGER_COMMAND=${TASK_TRIGGER_COMMAND:-}
+    labels: ["traefik.enable=false"]
+
+volumes:
+  prompt_studio_data:
+  unstract_data:
+  flipt_data:
+  qdrant_data:
+  rabbitmq_data:
+
+networks:
+  default:
+    name: unstract-network
