@@ -198,6 +198,8 @@ urlpatterns = [
         include("dashboard_metrics.internal_urls"),
         name="dashboard_metrics_internal",
     ),
+    # Daily inbox purge, called by the worker task the PG scheduler fires.
+    path("v1/inbox/", include("inbox.internal_urls"), name="inbox_internal"),
     # Workflow management and pipeline APIs
     path(
         "v1/workflow-manager/",
@@ -245,6 +247,12 @@ urlpatterns = [
         "v1/api-deployments/",
         include("api_v2.internal_urls"),
         name="api_deployments_internal",
+    ),
+    # Agent-KV stage-report and finalize APIs for the cloud executor
+    path(
+        "v1/agent-kv/",
+        include("agent_kv.internal_urls"),
+        name="agent_kv_internal",
     ),
     # Platform configuration and settings APIs
     path(

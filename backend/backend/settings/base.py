@@ -15,6 +15,7 @@ import re
 from pathlib import Path
 from urllib.parse import quote
 
+from django.core.exceptions import ImproperlyConfigured
 from django.core.validators import URLValidator
 from dotenv import find_dotenv, load_dotenv
 from utils.common_utils import CommonUtils
@@ -207,6 +208,143 @@ API_DEPLOYMENT_RATE_LIMIT_LOCK_BLOCKING_TIMEOUT = int(
 )
 
 
+# Agent-KV API
+#
+# Validated at import, because this value is added to `WHITELISTED_PATHS` and
+# `CustomAuthMiddleware` matches that list with `startswith`. An empty or
+# whitespace-only value makes the entry `/`, which is a prefix of every path on
+# the service -- authentication would be skipped for ALL of them. A value that
+# collides with another mounted prefix (`api`, `api/v1`, `deployment`) exempts
+# that whole surface instead. Both are operator mistakes rather than attacks,
+# and both are silent: the server starts, every request succeeds, and nothing
+# in any log says the API is now unauthenticated.
+#
+# Refused loudly at startup instead. `ImproperlyConfigured` is Django's own
+# signal for this and aborts the boot, which is the only outcome that cannot
+# be missed.
+def validate_agent_kv_path_prefix(raw, path_prefix, deployment_prefix):
+    """Normalise and refuse an unsafe `AGENT_KV_PATH_PREFIX`.
+
+    A function rather than inline statements so it is testable without
+    re-importing the settings module under a patched environment -- the
+    behaviour being guarded is an auth bypass, and it deserves a test that
+    enumerates the bad values rather than one that can only check the good one.
+    """
+    prefix = (raw or "").strip().strip("/")
+    if not prefix:
+        raise ImproperlyConfigured(
+            "AGENT_KV_PATH_PREFIX must not be empty: it is whitelisted out of "
+            "authentication by prefix match, so an empty value exempts every "
+            "path on this service."
+        )
+    for other_name, other in (
+        ("PATH_PREFIX", path_prefix),
+        ("API_DEPLOYMENT_PATH_PREFIX", deployment_prefix),
+    ):
+        # Equal, or an ancestor of the other: either way one whitelist entry
+        # swallows the other surface.
+        if prefix == other or other.startswith(f"{prefix}/"):
+            raise ImproperlyConfigured(
+                f"AGENT_KV_PATH_PREFIX={prefix!r} collides with "
+                f"{other_name}={other!r}. It is whitelisted out of "
+                "authentication by prefix match, so this would exempt that "
+                "surface too."
+            )
+    return prefix
+
+
+# Under PATH_PREFIX, not beside it: `/api/v1/agent-kv/`. It is a product API
+# like every other one the platform serves, and sharing the prefix means the
+# LB rule that already routes `/api/v1` covers it -- no dedicated ingress
+# entry to add, and nothing to keep in step with this value. That coupling
+# was a real gap: on-prem values files replace `ingress.hosts` wholesale and
+# carried no `/agent-kv`, so the API answered the SPA's HTML there.
+#
+# It is NOT under TENANT_SUBFOLDER_PREFIX (`api/v1/unstract`), because it
+# resolves its organisation from the Bearer key rather than a URL segment.
+AGENT_KV_PATH_PREFIX = validate_agent_kv_path_prefix(
+    os.environ.get("AGENT_KV_PATH_PREFIX", f"{PATH_PREFIX}/agent-kv"),
+    PATH_PREFIX,
+    API_DEPLOYMENT_PATH_PREFIX,
+)
+# Bucket-rooted object-store root for staged inputs/results, mirroring
+# WORKFLOW_EXECUTION_DIR_PREFIX / API_EXECUTION_DIR_PREFIX: the FIRST segment is
+# the bucket (s3fs/gcsfs treat it that way), so it must already exist. MUST match
+# the cloud executor's AGENT_KV_STORAGE_DIR_PREFIX -- the executor keys its OCR
+# cache under the same root.
+AGENT_KV_STORAGE_DIR_PREFIX = (
+    os.environ.get("AGENT_KV_STORAGE_DIR_PREFIX", "unstract/agent_kv").strip().strip("/")
+    or "unstract/agent_kv"
+)  # same normalisation as the cloud executor's reader (whitespace, edge slashes)
+AGENT_KV_MAX_FILE_SIZE_MB = int(os.environ.get("AGENT_KV_MAX_FILE_SIZE_MB", 50))
+
+#: Test/dev only: waive the https-and-public-host rule on `webhook_url` at
+#: SUBMIT, matching the waiver `workers/ide_callback/agent_kv_tasks.py` already
+#: reads at delivery. One switch, honoured on both sides.
+#:
+#: Needed because submit-side validation and the delivery guard have to agree:
+#: with the check only at the sink, the e2e webhook scenario could post to a
+#: receiver on the compose host; with it only at submit, that scenario 400s
+#: before a job exists. Unset in production, where both guards stay mandatory.
+AGENT_KV_WEBHOOK_INSECURE_ALLOW_HTTP_PRIVATE = os.environ.get(
+    "AGENT_KV_WEBHOOK_INSECURE_ALLOW_HTTP_PRIVATE", ""
+).lower() in ("1", "true", "yes")
+AGENT_KV_MAX_PAGES = int(os.environ.get("AGENT_KV_MAX_PAGES", 100))
+AGENT_KV_MAX_CALCULATIONS_BYTES = int(
+    os.environ.get("AGENT_KV_MAX_CALCULATIONS_BYTES", 20_000)
+)
+AGENT_KV_MAX_SCHEMA_BYTES = int(os.environ.get("AGENT_KV_MAX_SCHEMA_BYTES", 262_144))
+AGENT_KV_RESULT_TTL_DAYS = int(os.environ.get("AGENT_KV_RESULT_TTL_DAYS", 7))
+AGENT_KV_MAX_TIMEOUT_SECONDS = int(os.environ.get("AGENT_KV_MAX_TIMEOUT_SECONDS", 300))
+AGENT_KV_CONCURRENT_LIMIT = int(os.environ.get("AGENT_KV_CONCURRENT_LIMIT", 5))
+AGENT_KV_KEY_RATE_LIMIT_PER_MINUTE = int(
+    os.environ.get("AGENT_KV_KEY_RATE_LIMIT_PER_MINUTE", 60)
+)
+# When Redis is unreachable, do requests proceed? Default False = fail CLOSED
+# (429). Both Agent-KV limiters used to fail open implicitly, inside an `except`
+# block, so a Sentinel failover removed the concurrency ceiling and the per-key
+# rate ceiling at once while the API kept accepting billable LLM work. Fail-open
+# remains available as a deliberate, visible operational choice.
+AGENT_KV_LIMITER_FAIL_OPEN = (
+    os.environ.get("AGENT_KV_LIMITER_FAIL_OPEN", "false").lower() == "true"
+)
+AGENT_KV_SWEEP_GRACE_SECONDS = int(os.environ.get("AGENT_KV_SWEEP_GRACE_SECONDS", 3600))
+AGENT_KV_STUCK_JOB_GRACE_SECONDS = int(
+    os.environ.get("AGENT_KV_STUCK_JOB_GRACE_SECONDS", 21600)
+)
+#: How long after DISPATCH a cancelled job's executor is presumed dead, so the
+#: sweep may release the concurrency slot it still holds.
+#:
+#: Its own setting, and deliberately shorter than both the stuck grace and
+#: `rate_limiter.SLOT_TTL_SECONDS`. Phase 3 of the sweep used the stuck grace
+#: as its floor and the slot TTL as its ceiling; both default to 21600, so the
+#: window was `completed_at < now-21600 AND completed_at > now-21600` -- empty,
+#: and empty for ANY grace >= TTL. The phase could never select a row, and
+#: `released` was always 0.
+#:
+#: Measured from the CANCEL, not from dispatch. `dispatched_at` records
+#: enqueueing, so under a queue backlog a job can be an hour past dispatch
+#: with an executor that has only just started -- releasing then would free a
+#: slot still in use. Cancelling is what makes a live executor stop, so the
+#: grace runs from there.
+#:
+#: One hour rather than six because a live executor learns of the cancel at
+#: its next stage report, so an hour of silence after it is already strong
+#: evidence that nothing is coming.
+#: Waiting the full six hours is indistinguishable from waiting for Redis to
+#: expire the slot on its own, which is the behaviour this phase exists to
+#: improve on.
+AGENT_KV_ABANDONED_SLOT_GRACE_SECONDS = int(
+    os.environ.get("AGENT_KV_ABANDONED_SLOT_GRACE_SECONDS", 3600)
+)
+AGENT_KV_CALCULATIONS_ENABLED = (
+    os.environ.get("AGENT_KV_CALCULATIONS_ENABLED", "false").lower() == "true"
+)
+AGENT_KV_STRUCTURED_OUTPUT_ENABLED = (
+    os.environ.get("AGENT_KV_STRUCTURED_OUTPUT_ENABLED", "false").lower() == "true"
+)
+
+
 DB_NAME = os.environ.get("DB_NAME", "unstract_db")
 DB_USER = os.environ.get("DB_USER", "unstract_dev")
 DB_HOST = os.environ.get("DB_HOST", "backend-db-1")
@@ -320,6 +458,13 @@ NOTIFICATION_DISPATCH_LEASE_SECONDS = int(
 NOTIFICATION_MAX_DISPATCH_ATTEMPTS = int(
     os.environ.get("NOTIFICATION_MAX_DISPATCH_ATTEMPTS", "5")
 )
+# How long platform audit events (Settings > Audit log) stay readable. This is
+# the default; each org can override it (Configuration key
+# PLATFORM_AUDIT_RETENTION_DAYS). Older rows are hidden from every read and are
+# deleted by the purge_platform_audit_events management command.
+PLATFORM_AUDIT_RETENTION_DAYS = int(
+    os.environ.get("PLATFORM_AUDIT_RETENTION_DAYS", "365")
+)
 ATOMIC_REQUESTS = CommonUtils.str_to_bool(
     os.environ.get("DJANGO_ATOMIC_REQUESTS", "False")
 )
@@ -334,7 +479,8 @@ SECRET_KEY = get_required_setting("DJANGO_SECRET_KEY")
 ENCRYPTION_KEY = get_required_setting("ENCRYPTION_KEY")
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+# Off unless DJANGO_DEBUG asks for it: the published image runs settings.dev.
+DEBUG = CommonUtils.str_to_bool(os.environ.get("DJANGO_DEBUG", "False"))
 
 ALLOWED_HOSTS = ["*"]
 CSRF_TRUSTED_ORIGINS = [WEB_APP_ORIGIN_URL, WEB_APP_ORIGIN_URL_WITH_WILD_CARD]
@@ -427,6 +573,8 @@ SHARED_APPS = (
     "commands",
     # health checks
     "health",
+    # Platform-wide Prometheus /metrics
+    "platform_metrics",
     "migrating.v2",
     "connector_auth_v2",
     "tenant_account_v2",
@@ -444,6 +592,7 @@ SHARED_APPS = (
     "mcp_server",
     "usage_v2",
     "notification_v2",
+    "inbox",
     "prompt_studio.prompt_profile_manager_v2",
     "prompt_studio.prompt_studio_v2",
     "prompt_studio.prompt_studio_core_v2",
@@ -456,6 +605,9 @@ SHARED_APPS = (
     "dashboard_metrics",
     "platform_api",
     "global_api_deployment_key",
+    "platform_audit",
+    "global_search",
+    "agent_kv",
 )
 TENANT_APPS = []
 
@@ -948,6 +1100,8 @@ SPECTACULAR_SETTINGS = {
     "ENUM_NAME_OVERRIDES": {
         "ErrorType": "api_v2.openapi_schema.ERROR_TYPES",
         "ApiKeyPermission": "platform_api.models.ApiKeyPermission.choices",
+        "CapabilityKey": "tenant_account_v2.capabilities.CAPABILITY_KEY_VALUES",
+        "CapabilitySetting": "tenant_account_v2.capabilities.CAPABILITY_SETTING_VALUES",
     },
     # Group descriptions generated clients show in their help; without this
     # the spec has no root `tags` array for the text to live in.
@@ -980,13 +1134,101 @@ WHITELISTED_PATHS_LIST = [
     "/static",
 ]
 WHITELISTED_PATHS = [f"/{PATH_PREFIX}{PATH}" for PATH in WHITELISTED_PATHS_LIST]
-# White lists workflow-api-deployment path. This also covers the deployment MCP
-# server, which hangs off the same URL and authenticates with the deployment's
-# own API key rather than a session.
-WHITELISTED_PATHS.append(f"/{API_DEPLOYMENT_PATH_PREFIX}")
+WHITELISTED_PATHS.extend(
+    [
+        # workflow-api-deployment. Also covers the deployment MCP server, which
+        # hangs off the same URL and authenticates with the deployment's own API
+        # key rather than a session.
+        f"/{API_DEPLOYMENT_PATH_PREFIX}",
+        # Agent-KV public API: bearer-key auth happens in the views.
+        f"/{AGENT_KV_PATH_PREFIX}",
+    ]
+)
 
 # Whitelisting health check API
 WHITELISTED_PATHS.append("/health")
+
+# Platform-wide Prometheus /metrics (platform_metrics). Mounted at the root
+# like /health, outside every public ingress prefix, so it is served on the
+# backend service for in-cluster scraping only. Exempt from session auth; set
+# PLATFORM_METRICS_TOKEN to additionally require `Authorization: Bearer <token>`.
+WHITELISTED_PATHS.append("/metrics")
+PLATFORM_METRICS_TOKEN = os.environ.get("PLATFORM_METRICS_TOKEN", "")
+# How long one pod's refresh of a metric group is shared via Redis.
+PLATFORM_METRICS_CACHE_TTL_SECONDS = int(
+    os.environ.get("PLATFORM_METRICS_CACHE_TTL_SECONDS", 15)
+)
+# Postgres statement timeout for each group's refresh.
+PLATFORM_METRICS_QUERY_TIMEOUT_MS = int(
+    os.environ.get("PLATFORM_METRICS_QUERY_TIMEOUT_MS", 5000)
+)
+# unstract_workflow_executions_recent counts executions that went terminal
+# within this window...
+PLATFORM_METRICS_RECENT_WINDOW_SECONDS = int(
+    os.environ.get("PLATFORM_METRICS_RECENT_WINDOW_SECONDS", 3600)
+)
+# ...among executions created within this lookback, which keeps the query on
+# the created_at index instead of scanning the whole history.
+PLATFORM_METRICS_RECENT_LOOKBACK_SECONDS = int(
+    os.environ.get("PLATFORM_METRICS_RECENT_LOOKBACK_SECONDS", 86400)
+)
+# Same variable and default as the PG reaper, so unstract_batches_stuck counts
+# exactly what the reaper treats as stranded.
+PLATFORM_METRICS_BATCH_STUCK_TIMEOUT_SECONDS = int(
+    os.environ.get("WORKER_PG_BATCH_STUCK_TIMEOUT_SECONDS", 9000)
+)
+# Connect and read timeout for the metrics endpoint's own Redis pool, so a
+# stalled Redis fails a scrape over to the per-process fallback instead of
+# hanging it (KEDA's metrics-api client gives up after 3s).
+PLATFORM_METRICS_REDIS_TIMEOUT_SECONDS = float(
+    os.environ.get("PLATFORM_METRICS_REDIS_TIMEOUT_SECONDS", 1)
+)
+# Queue counts older than this are left out of the scrape instead of being
+# served as current, so a dashboard shows a gap and a KEDA trigger errors into
+# its fallback rather than scaling on a frozen value. Kept above the worst
+# healthy age (the cache TTL plus the 30s refresh-lock floor).
+PLATFORM_METRICS_QUEUE_MAX_STALENESS_SECONDS = int(
+    os.environ.get("PLATFORM_METRICS_QUEUE_MAX_STALENESS_SECONDS", 60)
+)
+# Queues always reported (as 0 when empty), on top of any queue that currently
+# holds messages. Defaults to the queues the PG consumers in
+# docker/docker-compose.yaml consume; override with a comma-separated list
+# where a deployment runs others.
+PLATFORM_METRICS_QUEUES = [
+    queue.strip()
+    for queue in os.environ.get(
+        "PLATFORM_METRICS_QUEUES",
+        ",".join(
+            [
+                "agent_kv_callback",
+                "api_file_processing",
+                "api_file_processing_callback",
+                "celery",
+                "celery_api_deployments",
+                "celery_callback",
+                "celery_executor_agentic",
+                "celery_executor_agentic_table",
+                "celery_executor_legacy",
+                "celery_executor_lookup_test",
+                "celery_executor_simple_prompt_studio",
+                "celery_executor_smart_table",
+                "celery_executor_table",
+                "dashboard_metric_events",
+                "file_processing",
+                "file_processing_callback",
+                "file_processing_priority",
+                "ide_callback",
+                "notifications",
+                "notifications_email",
+                "notifications_priority",
+                "notifications_sms",
+                "notifications_webhook",
+                "scheduler",
+            ]
+        ),
+    ).split(",")
+    if queue.strip()
+]
 
 # These path will work without organization in request.
 # `whoami` resolves the organisation from the API key itself, so it carries no
