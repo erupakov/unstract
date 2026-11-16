@@ -13,10 +13,10 @@ Handles:
 
 import logging
 import uuid
-from typing import Any
+from typing import Any, cast
 from uuid import UUID
 
-from unstract.core.data_models import ExecutionStatus
+from unstract.core.data_models import ALREADY_FINAL_REASON, ExecutionStatus
 
 from ..data.models import (
     BatchOperationRequest,
@@ -88,6 +88,15 @@ def circuit_breaker(
 logger = logging.getLogger(__name__)
 
 
+def refused_as_stopped(response: Any) -> bool:
+    """True when a status write was refused because an abort got there first."""
+    data = getattr(response, "data", None) or {}
+    return bool(
+        data.get("reason") == ALREADY_FINAL_REASON
+        and data.get("new_status") == ExecutionStatus.STOPPED.value
+    )
+
+
 class ExecutionAPIClient(BaseAPIClient):
     """Specialized API client for workflow execution operations.
 
@@ -147,6 +156,19 @@ class ExecutionAPIClient(BaseAPIClient):
                 status_code=getattr(e, "status_code", None),
             )
 
+    def get_workflow_execution_status(
+        self, execution_id: str | uuid.UUID, organization_id: str | None = None
+    ) -> str | None:
+        """Current status of an execution, from the lightweight status endpoint.
+
+        Raises on a failed request; the caller decides how to fail.
+        """
+        response = self.get(
+            self._build_url("workflow_execution", f"{execution_id}/status/"),
+            organization_id=organization_id,
+        )
+        return response.get("status") if isinstance(response, dict) else None
+
     def get_workflow_definition(
         self, workflow_id: str | uuid.UUID, organization_id: str | None = None
     ) -> ExecutionResponse:
@@ -172,7 +194,9 @@ class ExecutionAPIClient(BaseAPIClient):
                 message="Successfully retrieved workflow definition",
             )
         except Exception as e:
-            logger.error(f"Failed to get workflow definition for {workflow_id}: {str(e)}")
+            logger.exception(
+                f"Failed to get workflow definition for {workflow_id}: {str(e)}"
+            )
             return ExecutionResponse.error_response(
                 error=str(e),
                 execution_id=str(workflow_id),
@@ -329,7 +353,10 @@ class ExecutionAPIClient(BaseAPIClient):
         )
 
         # Convert dict response to consistent APIResponse
-        return convert_dict_response(response, APIResponse)
+        api_response = cast(APIResponse, convert_dict_response(response, APIResponse))
+        # The body is flat, and a refused write says why only there.
+        api_response.data = response
+        return api_response
 
     def recover_stuck_pg_executions(
         self,
@@ -536,7 +563,7 @@ class ExecutionAPIClient(BaseAPIClient):
             )
 
         except Exception as e:
-            logger.error(f"Failed to update pipeline {pipeline_id} status: {str(e)}")
+            logger.exception(f"Failed to update pipeline {pipeline_id} status: {str(e)}")
             return APIResponse(success=False, error=str(e))
 
     # Workflow execution finalization handled by status updates
@@ -565,7 +592,7 @@ class ExecutionAPIClient(BaseAPIClient):
             logger.debug(f"Incremented completed files for execution {execution_id}")
             return response
         except Exception as e:
-            logger.error(f"Failed to increment completed files: {str(e)}")
+            logger.exception(f"Failed to increment completed files: {str(e)}")
             return {"success": False, "error": str(e)}
 
     def increment_failed_files(
@@ -590,7 +617,7 @@ class ExecutionAPIClient(BaseAPIClient):
             logger.debug(f"Incremented failed files for execution {execution_id}")
             return response
         except Exception as e:
-            logger.error(f"Failed to increment failed files: {str(e)}")
+            logger.exception(f"Failed to increment failed files: {str(e)}")
             return {"success": False, "error": str(e)}
 
     def get_workflow_destination_config(
@@ -616,7 +643,7 @@ class ExecutionAPIClient(BaseAPIClient):
             logger.debug(f"Retrieved full response for workflow {workflow_id}")
             return response
         except Exception as e:
-            logger.error(f"Failed to get destination config: {str(e)}")
+            logger.exception(f"Failed to get destination config: {str(e)}")
             return {"type": "none", "error": str(e)}
 
     def check_file_history_batch(
@@ -772,7 +799,7 @@ class ExecutionAPIClient(BaseAPIClient):
                 return convert_dict_response(response, APIResponse)
 
         except Exception as e:
-            logger.error(f"Error parsing pipeline data for {pipeline_id}: {e}")
+            logger.exception(f"Error parsing pipeline data for {pipeline_id}: {e}")
             return APIResponse.error_response(
                 error=str(e),
                 message=f"Failed to parse pipeline data for {pipeline_id}",

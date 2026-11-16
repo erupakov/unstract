@@ -407,6 +407,10 @@ FILE_ACTIVE_CACHE_REDIS_DB = parse_db(
 INSTANT_WF_POLLING_TIMEOUT = int(
     os.environ.get("INSTANT_WF_POLLING_TIMEOUT", "300")
 )  # 5 minutes
+# A PENDING/EXECUTING run with no activity for this long is listed as stuck.
+STUCK_EXECUTION_THRESHOLD_SECONDS = int(
+    os.environ.get("STUCK_EXECUTION_THRESHOLD_SECONDS", "9000")
+)
 
 # ETL Pipeline minimum schedule interval (in seconds)
 # Default: 1800 seconds (30 minutes)
@@ -464,6 +468,22 @@ NOTIFICATION_MAX_DISPATCH_ATTEMPTS = int(
 # deleted by the purge_platform_audit_events management command.
 PLATFORM_AUDIT_RETENTION_DAYS = int(
     os.environ.get("PLATFORM_AUDIT_RETENTION_DAYS", "365")
+)
+# How often API key usage (last used, daily call counts) moves from Redis to the
+# database. Opening Settings > API keys also moves it, so the page is current
+# unless a flush is already running then.
+API_KEY_USAGE_FLUSH_INTERVAL_SECONDS = int(
+    os.environ.get("API_KEY_USAGE_FLUSH_INTERVAL_SECONDS", "300")
+)
+# Whether the first use in each interval starts that flush in a background
+# thread. Off only in tests, which flush inline.
+API_KEY_USAGE_BACKGROUND_FLUSH = True
+# Prefix of every Redis key API key usage writes.
+API_KEY_USAGE_REDIS_PREFIX = "api_key_usage"
+# Longest a key's request waits on Redis to record its use. A slower Redis loses
+# that count instead of slowing the request.
+API_KEY_USAGE_REDIS_TIMEOUT_SECONDS = float(
+    os.environ.get("API_KEY_USAGE_REDIS_TIMEOUT_SECONDS", "0.5")
 )
 ATOMIC_REQUESTS = CommonUtils.str_to_bool(
     os.environ.get("DJANGO_ATOMIC_REQUESTS", "False")
@@ -580,6 +600,7 @@ SHARED_APPS = (
     "tenant_account_v2",
     "connector_v2",
     "adapter_processor_v2",
+    "connection_check",
     "file_management",
     "workflow_manager.file_execution",
     "workflow_manager.endpoint_v2",
@@ -606,6 +627,7 @@ SHARED_APPS = (
     "platform_api",
     "global_api_deployment_key",
     "platform_audit",
+    "api_key_usage",
     "global_search",
     "agent_kv",
 )
@@ -992,6 +1014,9 @@ else:
     }
 
 SESSION_ENGINE = "django.contrib.sessions.backends.cached_db"
+# Dotted path to `callable(ip: str) -> str | None` naming an approximate location
+# for a signed-in session. Unset, sessions are listed without one.
+SESSION_LOCATION_RESOLVER = os.environ.get("SESSION_LOCATION_RESOLVER") or None
 
 RQ_QUEUES = {
     "default": {"USE_REDIS_CACHE": "default"},

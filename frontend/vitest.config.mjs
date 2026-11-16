@@ -47,11 +47,16 @@ function jsxInJs() {
  * reported as a failed file, not a failed assertion, and easy to read as
  * unrelated infrastructure noise.
  */
-function optionalPluginImports() {
+export function optionalPluginImports() {
   return {
     name: "optional-plugin-imports",
     resolveId(source, importer) {
-      if (!importer || !source.startsWith(".")) {
+      // v1 has no optional imports; a missing module there must fail.
+      if (
+        !importer ||
+        !source.startsWith(".") ||
+        importer.includes("/src/v1/")
+      ) {
         return null;
       }
       const sourcePath = source.split("?")[0].split("#")[0];
@@ -113,12 +118,16 @@ export default defineConfig({
      * known-good and known-bad trees (some with `*.test.ts` files) that
      * test-fixtures/v1-boundary/boundary.fixtures.mjs lints and type-checks;
      * they are inputs, not tests.
+     *
+     * `src/v1/` has its own config (vitest.v1.config.mts) and rig groups
+     * (`frontend-v1-*`), so a v1 result never changes this suite's.
      */
     exclude: [
       "**/node_modules/**",
       "**/dist/**",
       "**/build/**",
       "test-fixtures/**",
+      "src/v1/**",
     ],
   },
 });

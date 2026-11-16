@@ -283,7 +283,9 @@ class WorkflowHelper:
                     execution_id=str(workflow_execution.id),
                 )
             except Exception as e:
-                logger.error(f"Error in subscription usage plugin failure handler: {e}")
+                logger.exception(
+                    f"Error in subscription usage plugin failure handler: {e}"
+                )
 
         logger.error(
             f"Execution {workflow_execution.id} failed: {str(error)}", exc_info=True
@@ -781,7 +783,9 @@ class WorkflowHelper:
                 return ExecutionResponse(
                     workflow_id, execution_id, ExecutionStatus.EXECUTING.value
                 )
-            WorkflowExecutionServiceHelper.update_execution_err(execution_id, str(error))
+            marked = WorkflowExecutionServiceHelper.update_execution_err(
+                execution_id, str(error)
+            )
             logger.exception(
                 f"Error while enqueuing async job for WF '{workflow_id}', "
                 f"execution '{execution_id}'"
@@ -789,7 +793,8 @@ class WorkflowHelper:
             return ExecutionResponse(
                 workflow_id,
                 execution_id,
-                ExecutionStatus.ERROR.value,
+                # An aborted run stays STOPPED.
+                marked.status if marked else ExecutionStatus.ERROR.value,
                 error=str(error),
             )
 
@@ -1178,7 +1183,7 @@ class WorkflowHelper:
             response["status"] = 200
             return response
         except Exception as exc:
-            logger.error(f"Error occurred while clearing file marker : {exc}")
+            logger.exception(f"Error occurred while clearing file marker : {exc}")
             response["message"] = WorkflowMessages.FILE_MARKER_CLEAR_FAILED
             response["status"] = 400
             return response
