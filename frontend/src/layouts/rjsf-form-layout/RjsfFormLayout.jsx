@@ -2,7 +2,7 @@
 // `widgets` and `templates` for every field type, so the antd theme was only
 // contributing the wrapper chrome — there is no widget registry to rebuild.
 import Form from "@rjsf/core";
-import validator from "@rjsf/validator-ajv8";
+import { customizeValidator } from "@rjsf/validator-ajv8";
 import PropTypes from "prop-types";
 import { useCallback, useMemo } from "react";
 import { Space } from "@/components/ui/shims/antd-layout";
@@ -30,6 +30,23 @@ import { SpinnerLoader } from "../../components/widgets/spinner-loader/SpinnerLo
 import { CustomFieldTemplate } from "./CustomFieldTemplate.jsx";
 import { CustomObjectFieldTemplate } from "./CustomObjectFieldTemplate.jsx";
 import "./RjsfFormLayout.css";
+
+// ajv-formats' built-in `url` format rejects private/loopback hosts (10.x,
+// 172.16/12, 192.168.x, 127.x), which blocks self-hosted LLM / embedding /
+// extraction endpoints. Override it with a plain http(s) URL check; the
+// backend and adapters still do their own validation.
+const validator = customizeValidator({
+  customFormats: {
+    url: (value) => {
+      try {
+        const { protocol, hostname } = new URL(value);
+        return (protocol === "http:" || protocol === "https:") && !!hostname;
+      } catch {
+        return false;
+      }
+    },
+  },
+});
 
 function RjsfFormLayout({
   children,
