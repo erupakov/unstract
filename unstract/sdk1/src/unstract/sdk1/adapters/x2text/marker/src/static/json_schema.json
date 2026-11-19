@@ -1,0 +1,52 @@
+{
+  "title": "Marker Text Extractor",
+  "type": "object",
+  "required": ["adapter_name", "url"],
+  "properties": {
+    "adapter_name": {
+      "type": "string",
+      "title": "Name",
+      "default": "",
+      "description": "Provide a unique name for this adapter instance. Example: Marker 1"
+    },
+    "url": {
+      "type": "string",
+      "title": "URL",
+      "format": "url",
+      "default": "http://localhost:8001",
+      "description": "Root URL of the Marker server (marker_server). It must be reachable from the Unstract containers, so do not use localhost unless Marker runs in the same container."
+    },
+    "output_format": {
+      "type": "string",
+      "title": "Output Format",
+      "enum": ["markdown", "html", "json"],
+      "default": "markdown",
+      "description": "Format requested from Marker. Markdown is recommended for LLM processing."
+    },
+    "force_ocr": {
+      "type": "boolean",
+      "title": "Force OCR",
+      "default": false,
+      "description": "Run OCR on the whole document even if it contains extractable text."
+    },
+    "paginate_output": {
+      "type": "boolean",
+      "title": "Paginate Output",
+      "default": false,
+      "description": "Separate pages in the output with page delimiters."
+    },
+    "page_range": {
+      "type": "string",
+      "title": "Page Range",
+      "default": "",
+      "description": "Optional pages to process, e.g. 0,5-10,20. Leave empty for all pages."
+    },
+    "timeout": {
+      "type": "number",
+      "minimum": 1,
+      "title": "Timeout",
+      "default": 600,
+      "description": "Maximum time in seconds to wait for Marker to process a document."
+    }
+  }
+}
