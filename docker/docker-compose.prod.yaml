@@ -241,7 +241,7 @@ services:
     labels: ["traefik.enable=false"]
     volumes:
       - ./workflow_data:/data
-      - ${TOOL_REGISTRY_CONFIG_SRC_PATH}:/data/tool_registry_config
+      - ${TOOL_REGISTRY_CONFIG_SRC_PATH:-../unstract/tool-registry/tool_registry_config}:/data/tool_registry_config
 
   worker-pg-orchestrator-general:
     image: unstract/worker-unified:${VERSION}
@@ -264,7 +264,7 @@ services:
     labels: ["traefik.enable=false"]
     volumes:
       - ./workflow_data:/data
-      - ${TOOL_REGISTRY_CONFIG_SRC_PATH}:/data/tool_registry_config
+      - ${TOOL_REGISTRY_CONFIG_SRC_PATH:-../unstract/tool-registry/tool_registry_config}:/data/tool_registry_config
 
   worker-pg-fileproc:
     image: unstract/worker-unified:${VERSION}
@@ -288,7 +288,7 @@ services:
     labels: ["traefik.enable=false"]
     volumes:
       - ./workflow_data:/data
-      - ${TOOL_REGISTRY_CONFIG_SRC_PATH}:/data/tool_registry_config
+      - ${TOOL_REGISTRY_CONFIG_SRC_PATH:-../unstract/tool-registry/tool_registry_config}:/data/tool_registry_config
 
   worker-pg-callback:
     image: unstract/worker-unified:${VERSION}
@@ -311,7 +311,7 @@ services:
     labels: ["traefik.enable=false"]
     volumes:
       - ./workflow_data:/data
-      - ${TOOL_REGISTRY_CONFIG_SRC_PATH}:/data/tool_registry_config
+      - ${TOOL_REGISTRY_CONFIG_SRC_PATH:-../unstract/tool-registry/tool_registry_config}:/data/tool_registry_config
 
   worker-pg-scheduler:
     image: unstract/worker-unified:${VERSION}
@@ -334,7 +334,7 @@ services:
     labels: ["traefik.enable=false"]
     volumes:
       - ./workflow_data:/data
-      - ${TOOL_REGISTRY_CONFIG_SRC_PATH}:/data/tool_registry_config
+      - ${TOOL_REGISTRY_CONFIG_SRC_PATH:-../unstract/tool-registry/tool_registry_config}:/data/tool_registry_config
 
   worker-pg-metrics:
     image: unstract/worker-unified:${VERSION}
@@ -359,7 +359,7 @@ services:
     labels: ["traefik.enable=false"]
     volumes:
       - ./workflow_data:/data
-      - ${TOOL_REGISTRY_CONFIG_SRC_PATH}:/data/tool_registry_config
+      - ${TOOL_REGISTRY_CONFIG_SRC_PATH:-../unstract/tool-registry/tool_registry_config}:/data/tool_registry_config
 
   worker-log-stream-consumer:
     image: unstract/worker-unified:${VERSION}
@@ -401,7 +401,7 @@ services:
     labels: ["traefik.enable=false"]
     volumes:
       - ./workflow_data:/data
-      - ${TOOL_REGISTRY_CONFIG_SRC_PATH}:/data/tool_registry_config
+      - ${TOOL_REGISTRY_CONFIG_SRC_PATH:-../unstract/tool-registry/tool_registry_config}:/data/tool_registry_config
       - prompt_studio_data:/app/prompt-studio-data
 
   worker-pg-ide-callback:
@@ -426,7 +426,7 @@ services:
     labels: ["traefik.enable=false"]
     volumes:
       - ./workflow_data:/data
-      - ${TOOL_REGISTRY_CONFIG_SRC_PATH}:/data/tool_registry_config
+      - ${TOOL_REGISTRY_CONFIG_SRC_PATH:-../unstract/tool-registry/tool_registry_config}:/data/tool_registry_config
       - prompt_studio_data:/app/prompt-studio-data
 
   worker-pg-notification:
@@ -451,7 +451,7 @@ services:
     labels: ["traefik.enable=false"]
     volumes:
       - ./workflow_data:/data
-      - ${TOOL_REGISTRY_CONFIG_SRC_PATH}:/data/tool_registry_config
+      - ${TOOL_REGISTRY_CONFIG_SRC_PATH:-../unstract/tool-registry/tool_registry_config}:/data/tool_registry_config
       - prompt_studio_data:/app/prompt-studio-data
 
   worker-pg-reaper:
@@ -473,7 +473,7 @@ services:
     labels: ["traefik.enable=false"]
     volumes:
       - ./workflow_data:/data
-      - ${TOOL_REGISTRY_CONFIG_SRC_PATH}:/data/tool_registry_config
+      - ${TOOL_REGISTRY_CONFIG_SRC_PATH:-../unstract/tool-registry/tool_registry_config}:/data/tool_registry_config
 
   worker-log-history-scheduler-v2:
     <<: *host_gateway
